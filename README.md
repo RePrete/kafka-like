@@ -25,24 +25,13 @@ git clone https://github.com/RePrete/kafka-like.git
 cd kafka-like
 ```
 
-2. Install Protocol Buffers compiler and Go plugins:
-
-```bash
-# Install protoc (varies by platform)
-# For macOS with Homebrew:
-brew install protobuf
-
-# Install Go plugins
-make install-proto-tools
-```
-
-3. Generate gRPC code from proto files:
+2. Generate gRPC code from proto files:
 
 ```bash
 make proto
 ```
 
-4. Build the server and examples:
+3. Build the server and examples:
 
 ```bash
 make all
