@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "github.com/RePrete/kafka-like/proto";
+
+// QueueService provides operations for a Kafka-like message queue
+service QueueService {
+  // Admin operations
+  rpc CreateTopic(CreateTopicRequest) returns (CreateTopicResponse);
+  rpc DeleteTopic(DeleteTopicRequest) returns (DeleteTopicResponse);
+  rpc ListTopics(ListTopicsRequest) returns (ListTopicsResponse);
+  
+  // Producer operations
+  rpc Produce(ProduceRequest) returns (ProduceResponse);
+  
+  // Consumer operations
+  rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
+  rpc Consume(ConsumeRequest) returns (ConsumeResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  
+  // Streaming consumer operation
+  rpc ConsumeStream(ConsumeStreamRequest) returns (stream ConsumeResponse);
+}
+
+// Message represents a message in the queue
+message QueueMessage {
+  bytes key = 1;
+  bytes value = 2;
+  string topic = 3;
+  int32 partition = 4;
+  int64 offset = 5;
+  int64 timestamp = 6;
+  repeated MessageHeader headers = 7;
+}
+
+// MessageHeader represents a key-value header for a message
+message MessageHeader {
+  string key = 1;
+  bytes value = 2;
+}
+
+// Admin requests and responses
+message CreateTopicRequest {
+  string name = 1;
+  int32 partitions = 2;
+}
+
+message CreateTopicResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message DeleteTopicRequest {
+  string name = 1;
+}
+
+message DeleteTopicResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ListTopicsRequest {}
+
+message ListTopicsResponse {
+  repeated string topics = 1;
+  string error = 2;
+}
+
+// Producer requests and responses
+message ProduceRequest {
+  QueueMessage message = 1;
+}
+
+message ProduceResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// Consumer requests and responses
+message SubscribeRequest {
+  string group_id = 1;
+  repeated string topics = 2;
+}
+
+message SubscribeResponse {
+  bool success = 1;
+  string error = 2;
+  string consumer_id = 3;
+}
+
+message ConsumeRequest {
+  string consumer_id = 1;
+  int64 timeout_ms = 2;
+}
+
+message ConsumeResponse {
+  QueueMessage message = 1;
+  string error = 2;
+}
+
+message CommitRequest {
+  string consumer_id = 1;
+  QueueMessage message = 2;
+}
+
+message CommitResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ConsumeStreamRequest {
+  string consumer_id = 1;
+  int64 timeout_ms = 2;
+} 

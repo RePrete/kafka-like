@@ -1,0 +1,19 @@
+# Binaries and build artifacts
+bin/
+*.exe
+*.so
+*.dylib
+*.test
+*.out
+
+# Generated files
+proto/gen/
+
+# IDE and editor files
+.idea/
+.vscode/
+.DS_Store
+
+# Logs and environment
+*.log
+.env 
