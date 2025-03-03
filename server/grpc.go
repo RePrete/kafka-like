@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	pb "github.com/RePrete/kafka-like/proto/gen/proto"
@@ -15,7 +14,6 @@ import (
 type GRPCServer struct {
 	pb.UnimplementedQueueServiceServer
 	qm             *QueueManager
-	mu             sync.RWMutex
 	consumers      map[string]Consumer
 	nextConsumerID int
 	consumersByID  map[string]string // consumerID -> groupID mapping
@@ -122,9 +120,6 @@ func (s *GRPCServer) Produce(ctx context.Context, req *pb.ProduceRequest) (*pb.P
 
 // Subscribe implements the Subscribe RPC
 func (s *GRPCServer) Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	consumer, err := s.qm.NewConsumer(req.GroupId)
 	if err != nil {
 		return &pb.SubscribeResponse{
@@ -158,16 +153,15 @@ func (s *GRPCServer) Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*
 
 // Consume implements the Consume RPC
 func (s *GRPCServer) Consume(ctx context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {
-	s.mu.RLock()
+	// Find the consumer
 	consumer, exists := s.consumers[req.ConsumerId]
-	s.mu.RUnlock()
-
 	if !exists {
 		return &pb.ConsumeResponse{
-			Error: ErrConsumerNotFound.Error(),
+			Error: "consumer not found",
 		}, nil
 	}
 
+	// Try to consume a message
 	timeout := time.Duration(req.TimeoutMs) * time.Millisecond
 	msg, err := consumer.Consume(ctx, timeout)
 	if err != nil {
@@ -183,17 +177,14 @@ func (s *GRPCServer) Consume(ctx context.Context, req *pb.ConsumeRequest) (*pb.C
 		Topic:     msg.Topic,
 		Partition: int32(msg.Partition),
 		Offset:    msg.Offset,
-		Timestamp: msg.Timestamp.UnixMilli(),
+		Timestamp: msg.Timestamp.UnixNano(),
+		Headers:   make([]*pb.MessageHeader, len(msg.Headers)),
 	}
 
-	// Convert headers if any
-	if len(msg.Headers) > 0 {
-		pbMsg.Headers = make([]*pb.MessageHeader, len(msg.Headers))
-		for i, h := range msg.Headers {
-			pbMsg.Headers[i] = &pb.MessageHeader{
-				Key:   h.Key,
-				Value: h.Value,
-			}
+	for i, header := range msg.Headers {
+		pbMsg.Headers[i] = &pb.MessageHeader{
+			Key:   header.Key,
+			Value: header.Value,
 		}
 	}
 
@@ -204,14 +195,12 @@ func (s *GRPCServer) Consume(ctx context.Context, req *pb.ConsumeRequest) (*pb.C
 
 // Commit implements the Commit RPC
 func (s *GRPCServer) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
-	s.mu.RLock()
+	// Find the consumer
 	consumer, exists := s.consumers[req.ConsumerId]
-	s.mu.RUnlock()
-
 	if !exists {
 		return &pb.CommitResponse{
 			Success: false,
-			Error:   ErrConsumerNotFound.Error(),
+			Error:   "consumer not found",
 		}, nil
 	}
 
@@ -222,20 +211,18 @@ func (s *GRPCServer) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.Com
 		Topic:     req.Message.Topic,
 		Partition: int(req.Message.Partition),
 		Offset:    req.Message.Offset,
-		Timestamp: time.UnixMilli(req.Message.Timestamp),
+		Timestamp: time.Unix(0, req.Message.Timestamp),
+		Headers:   make([]Header, len(req.Message.Headers)),
 	}
 
-	// Convert headers if any
-	if len(req.Message.Headers) > 0 {
-		msg.Headers = make([]Header, len(req.Message.Headers))
-		for i, h := range req.Message.Headers {
-			msg.Headers[i] = Header{
-				Key:   h.Key,
-				Value: h.Value,
-			}
+	for i, header := range req.Message.Headers {
+		msg.Headers[i] = Header{
+			Key:   header.Key,
+			Value: header.Value,
 		}
 	}
 
+	// Commit the message
 	err := consumer.Commit(msg)
 	if err != nil {
 		return &pb.CommitResponse{
@@ -251,10 +238,7 @@ func (s *GRPCServer) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.Com
 
 // ConsumeStream implements the streaming consumer RPC
 func (s *GRPCServer) ConsumeStream(req *pb.ConsumeStreamRequest, stream pb.QueueService_ConsumeStreamServer) error {
-	s.mu.RLock()
 	consumer, exists := s.consumers[req.ConsumerId]
-	s.mu.RUnlock()
-
 	if !exists {
 		return status.Errorf(codes.NotFound, "consumer not found: %s", req.ConsumerId)
 	}
@@ -296,36 +280,16 @@ func (s *GRPCServer) ConsumeStream(req *pb.ConsumeStreamRequest, stream pb.Queue
 	})
 }
 
-// CloseConsumer closes a consumer by ID
-func (s *GRPCServer) CloseConsumer(consumerID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	consumer, exists := s.consumers[consumerID]
-	if !exists {
-		return ErrConsumerNotFound
-	}
-
-	err := consumer.Close()
-	if err != nil {
-		return err
-	}
-
-	delete(s.consumers, consumerID)
-	delete(s.consumersByID, consumerID)
-	return nil
-}
-
-// Close closes all consumers and cleans up resources
+// Close implements the Close method for the GRPCServer
 func (s *GRPCServer) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for id, consumer := range s.consumers {
+	// Close all consumers
+	for _, consumer := range s.consumers {
 		consumer.Close()
-		delete(s.consumers, id)
-		delete(s.consumersByID, id)
 	}
+
+	// Clear maps
+	s.consumers = make(map[string]Consumer)
+	s.consumersByID = make(map[string]string)
 
 	return nil
 }

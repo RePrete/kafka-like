@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 )
 
@@ -71,7 +70,6 @@ type Admin interface {
 
 // QueueManager manages the message queue system
 type QueueManager struct {
-	mu             sync.RWMutex
 	topics         map[string]*topic
 	producers      map[int]Producer
 	consumers      map[int]Consumer
@@ -83,7 +81,6 @@ type QueueManager struct {
 type topic struct {
 	name       string
 	partitions []*partition
-	mu         sync.RWMutex
 }
 
 // partition represents a topic partition
@@ -91,7 +88,6 @@ type partition struct {
 	id       int
 	messages []*Message
 	offset   int64
-	mu       sync.RWMutex
 }
 
 // consumerGroup manages a group of consumers
@@ -99,8 +95,7 @@ type consumerGroup struct {
 	id            string
 	topics        []string
 	offsets       map[string]map[int]int64 // topic -> partition -> offset
-	mu            sync.RWMutex
-	commitedMsgs  map[string]bool // message unique ID -> committed
+	commitedMsgs  map[string]bool          // message unique ID -> committed
 	lastHeartbeat time.Time
 }
 
@@ -120,9 +115,6 @@ func (qm *QueueManager) NewAdmin() Admin {
 
 // NewProducer creates a new producer
 func (qm *QueueManager) NewProducer() Producer {
-	qm.mu.Lock()
-	defer qm.mu.Unlock()
-
 	id := qm.nextProducerID
 	qm.nextProducerID++
 
@@ -137,9 +129,6 @@ func (qm *QueueManager) NewProducer() Producer {
 
 // NewConsumer creates a new consumer with a group ID
 func (qm *QueueManager) NewConsumer(groupID string) (Consumer, error) {
-	qm.mu.Lock()
-	defer qm.mu.Unlock()
-
 	id := qm.nextConsumerID
 	qm.nextConsumerID++
 
@@ -165,51 +154,46 @@ type adminClient struct {
 }
 
 func (a *adminClient) CreateTopic(ctx context.Context, name string, partitions int) error {
-	a.qm.mu.Lock()
-	defer a.qm.mu.Unlock()
-
+	// Check if topic already exists
 	if _, exists := a.qm.topics[name]; exists {
-		return nil // Topic already exists
+		return fmt.Errorf("topic %s already exists", name)
 	}
 
-	newTopic := &topic{
-		name:       name,
-		partitions: make([]*partition, partitions),
-	}
-
+	// Create partitions
+	topicPartitions := make([]*partition, partitions)
 	for i := 0; i < partitions; i++ {
-		newTopic.partitions[i] = &partition{
+		topicPartitions[i] = &partition{
 			id:       i,
 			messages: make([]*Message, 0),
 			offset:   0,
 		}
 	}
 
-	a.qm.topics[name] = newTopic
+	// Create topic
+	a.qm.topics[name] = &topic{
+		name:       name,
+		partitions: topicPartitions,
+	}
+
 	return nil
 }
 
 func (a *adminClient) DeleteTopic(ctx context.Context, name string) error {
-	a.qm.mu.Lock()
-	defer a.qm.mu.Unlock()
-
+	// Check if topic exists
 	if _, exists := a.qm.topics[name]; !exists {
-		return ErrTopicNotFound
+		return fmt.Errorf("topic %s does not exist", name)
 	}
 
+	// Delete topic
 	delete(a.qm.topics, name)
 	return nil
 }
 
 func (a *adminClient) ListTopics(ctx context.Context) ([]string, error) {
-	a.qm.mu.RLock()
-	defer a.qm.mu.RUnlock()
-
 	topics := make([]string, 0, len(a.qm.topics))
-	for topicName := range a.qm.topics {
-		topics = append(topics, topicName)
+	for name := range a.qm.topics {
+		topics = append(topics, name)
 	}
-
 	return topics, nil
 }
 
@@ -224,37 +208,36 @@ type producerClient struct {
 }
 
 func (p *producerClient) Produce(ctx context.Context, msg *Message) error {
-	p.qm.mu.RLock()
+	// Check if topic exists
 	topic, exists := p.qm.topics[msg.Topic]
-	p.qm.mu.RUnlock()
-
 	if !exists {
-		return ErrTopicNotFound
+		return fmt.Errorf("topic %s does not exist", msg.Topic)
 	}
 
-	topic.mu.RLock()
-	if msg.Partition >= len(topic.partitions) || msg.Partition < 0 {
-		msg.Partition = 0 // Default to first partition if invalid
+	// Check if partition exists
+	if msg.Partition < 0 || msg.Partition >= len(topic.partitions) {
+		return fmt.Errorf("invalid partition %d for topic %s", msg.Partition, msg.Topic)
 	}
+
 	partition := topic.partitions[msg.Partition]
-	topic.mu.RUnlock()
 
-	partition.mu.Lock()
-	defer partition.mu.Unlock()
+	// Set message timestamp if not set
+	if msg.Timestamp.IsZero() {
+		msg.Timestamp = time.Now()
+	}
 
+	// Set message offset
 	msg.Offset = partition.offset
-	msg.Timestamp = time.Now()
-
-	partition.messages = append(partition.messages, msg)
 	partition.offset++
+
+	// Add message to partition
+	partition.messages = append(partition.messages, msg)
 
 	return nil
 }
 
 func (p *producerClient) Close() error {
-	p.qm.mu.Lock()
-	defer p.qm.mu.Unlock()
-
+	// Remove producer from queue manager
 	delete(p.qm.producers, p.id)
 	return nil
 }
@@ -268,96 +251,73 @@ type consumerClient struct {
 }
 
 func (c *consumerClient) Subscribe(topics []string) error {
-	c.qm.mu.RLock()
-	defer c.qm.mu.RUnlock()
-
-	c.group.mu.Lock()
-	defer c.group.mu.Unlock()
-
-	// Verify all topics exist
+	// Check if topics exist
 	for _, topicName := range topics {
 		if _, exists := c.qm.topics[topicName]; !exists {
-			return ErrTopicNotFound
-		}
-
-		// Initialize offset tracking for this topic
-		if _, exists := c.group.offsets[topicName]; !exists {
-			c.group.offsets[topicName] = make(map[int]int64)
-
-			// Initialize offsets to 0 for all partitions
-			topic := c.qm.topics[topicName]
-			for i := 0; i < len(topic.partitions); i++ {
-				c.group.offsets[topicName][i] = 0
-			}
+			return fmt.Errorf("topic %s does not exist", topicName)
 		}
 	}
 
+	// Set topics for consumer group
 	c.group.topics = topics
-	c.group.lastHeartbeat = time.Now()
+
+	// Initialize offsets for topics
+	for _, topicName := range topics {
+		topic := c.qm.topics[topicName]
+
+		// Initialize topic offsets if not already initialized
+		if _, exists := c.group.offsets[topicName]; !exists {
+			c.group.offsets[topicName] = make(map[int]int64)
+		}
+
+		// Initialize partition offsets if not already initialized
+		for _, partition := range topic.partitions {
+			if _, exists := c.group.offsets[topicName][partition.id]; !exists {
+				c.group.offsets[topicName][partition.id] = 0
+			}
+		}
+	}
 
 	return nil
 }
 
 func (c *consumerClient) Consume(ctx context.Context, timeout time.Duration) (*Message, error) {
-	c.group.mu.Lock()
+	// Update heartbeat
 	c.group.lastHeartbeat = time.Now()
-	topics := c.group.topics
-	c.group.mu.Unlock()
 
-	if len(topics) == 0 {
-		return nil, errors.New("no topics subscribed")
-	}
+	// Try to get a message from each topic and partition
+	for _, topicName := range c.group.topics {
+		topic, exists := c.qm.topics[topicName]
+		if !exists {
+			continue
+		}
 
-	// Set a deadline based on the timeout
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
-		for _, topicName := range topics {
-			c.qm.mu.RLock()
-			topic, exists := c.qm.topics[topicName]
-			c.qm.mu.RUnlock()
-
+		for _, partition := range topic.partitions {
+			// Get current offset for this partition
+			offset, exists := c.group.offsets[topicName][partition.id]
 			if !exists {
 				continue
 			}
 
-			topic.mu.RLock()
-			partitions := topic.partitions
-			topic.mu.RUnlock()
+			// Check if there are messages available at this offset
+			if offset < partition.offset && offset >= 0 && int(offset) < len(partition.messages) {
+				msg := partition.messages[int(offset)]
 
-			for _, partition := range partitions {
-				partition.mu.RLock()
-
-				c.group.mu.RLock()
-				offset, exists := c.group.offsets[topicName][partition.id]
-				c.group.mu.RUnlock()
-
-				if !exists {
-					partition.mu.RUnlock()
+				// Check if message has already been committed
+				msgID := generateMessageID(msg)
+				if c.group.commitedMsgs[msgID] {
+					// Message already committed, move to next offset
+					c.group.offsets[topicName][partition.id]++
 					continue
 				}
 
-				// Check if there are messages available at or after the current offset
-				if int64(len(partition.messages)) > offset {
-					msg := partition.messages[offset]
-					partition.mu.RUnlock()
-					return msg, nil
-				}
-
-				partition.mu.RUnlock()
+				return msg, nil
 			}
-		}
-
-		// No messages found, wait a bit before trying again
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-			// Continue trying
 		}
 	}
 
-	return nil, ErrNoMessage
+	// No messages available
+	return nil, fmt.Errorf("no message available")
 }
 
 func (c *consumerClient) ConsumeWithHandler(ctx context.Context, timeout time.Duration, handler func(*Message) error) error {
@@ -409,28 +369,31 @@ func (c *consumerClient) ConsumeWithHandler(ctx context.Context, timeout time.Du
 }
 
 func (c *consumerClient) Commit(msg *Message) error {
-	c.group.mu.Lock()
-	defer c.group.mu.Unlock()
-
-	// Update the offset for this topic and partition
+	// Check if topic exists
 	if _, exists := c.group.offsets[msg.Topic]; !exists {
-		c.group.offsets[msg.Topic] = make(map[int]int64)
+		return fmt.Errorf("topic %s not subscribed", msg.Topic)
 	}
 
-	// Set the offset to the next message
-	c.group.offsets[msg.Topic][msg.Partition] = msg.Offset + 1
+	// Check if partition exists
+	if _, exists := c.group.offsets[msg.Topic][msg.Partition]; !exists {
+		return fmt.Errorf("partition %d not subscribed for topic %s", msg.Partition, msg.Topic)
+	}
 
-	// Mark this message as committed
+	// Mark message as committed
 	msgID := generateMessageID(msg)
 	c.group.commitedMsgs[msgID] = true
+
+	// Update offset if this is the current message
+	currentOffset := c.group.offsets[msg.Topic][msg.Partition]
+	if currentOffset == msg.Offset {
+		c.group.offsets[msg.Topic][msg.Partition]++
+	}
 
 	return nil
 }
 
 func (c *consumerClient) Close() error {
-	c.qm.mu.Lock()
-	defer c.qm.mu.Unlock()
-
+	// Remove consumer from queue manager
 	delete(c.qm.consumers, c.id)
 	return nil
 }
